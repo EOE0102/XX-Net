@@ -4,8 +4,9 @@ import time
 import collections
 import operator
 
-import global_var as g
+from . import global_var as g
 
+import utils
 from xlog import getLogger
 xlog = getLogger("smart_router")
 
@@ -48,7 +49,7 @@ class DomainRecords(object):
     def get(self, domain):
         with self.lock:
             try:
-                record = self.cache.pop(domain)
+                record = self.cache[domain]
 
                 time_now = time.time()
                 if time_now - record["update"] > self.ttl:
@@ -58,7 +59,7 @@ class DomainRecords(object):
 
             if not record:
                 record = {"r": "unknown", "ip": {}, "g": 1, "query_count": 0}
-            self.cache[domain] = record
+            #self.cache[domain] = record
             return record
 
     def set(self, domain, record):
@@ -69,6 +70,7 @@ class DomainRecords(object):
                 if len(self.cache) >= self.capacity:
                     self.cache.popitem(last=False)
 
+            record["update"] = time.time()
             self.cache[domain] = record
             self.need_save = True
             self.last_update_time = time.time()
@@ -153,9 +155,8 @@ class DomainRecords(object):
 
         with self.lock:
             with open(self.file_path, "w") as fd:
-                for host in self.cache:
-                    record = self.cache[host]
-                    line = host + " " + record["r"] + " " + str(record["g"]) + " "
+                for host, record in self.cache.items():
+                    line = utils.to_str(host) + " " + record["r"] + " " + str(record["g"]) + " "
                     if len(record["ip"]) and time_now - record["update"] < self.ttl:
                         for ip in record["ip"]:
                             cn = record["ip"][ip]
@@ -201,7 +202,7 @@ class DomainRecords(object):
         if not ip_rate:
             return []
 
-        ip_time = sorted(ip_rate.items(), key=operator.itemgetter(1))
+        ip_time = sorted(list(ip_rate.items()), key=operator.itemgetter(1))
 
         ordered_ips = []
         for ip, rate in ip_time:
@@ -217,6 +218,7 @@ class DomainRecords(object):
             record["r"] = rule
 
         for ipd in ips:
+            ipd = utils.to_str(ipd)
             ipl = ipd.split("|")
             ip = ipl[0]
             cn = ipl[1]

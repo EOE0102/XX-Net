@@ -9,7 +9,6 @@ import socket
 import time
 import re
 import select
-import collections
 import random
 
 current_path = os.path.dirname(os.path.abspath(__file__))
@@ -17,7 +16,7 @@ root_path = os.path.abspath(os.path.join(current_path, os.pardir, os.pardir))
 top_path = os.path.abspath(os.path.join(root_path, os.pardir, os.pardir))
 data_path = os.path.join(top_path, "data", 'smart_router')
 
-python_path = os.path.join(root_path, 'python27', '1.0')
+python_path = root_path
 noarch_lib = os.path.join(python_path, 'lib', 'noarch')
 sys.path.append(noarch_lib)
 
@@ -25,7 +24,7 @@ import simple_queue
 import utils
 from dnslib import DNSRecord, DNSHeader, A, AAAA, RR, DNSQuestion, QTYPE
 
-import global_var as g
+from . import global_var as g
 from xlog import getLogger
 xlog = getLogger("smart_router")
 
@@ -34,37 +33,44 @@ def remote_query_dns(domain, type=None):
     if not g.x_tunnel:
         return []
 
+    t0 = time.time()
     content, status, response = g.x_tunnel.front_dispatcher.request(
-        "GET", "dns.xx-net.net", path="/query?domain=%s" % (domain), timeout=5)
+        "GET", "dns.xx-net.net", path="/query?domain=%s" % utils.to_str(domain), timeout=5)
+    t1 = time.time()
 
     if status != 200:
-        xlog.warn("remote_query_dns fail status:%d", status)
+        xlog.warn("remote_query_dns fail status:%d, cost=%f", status, t1-t0)
         return []
 
     if isinstance(content, memoryview):
         content = content.tobytes()
 
+    content = utils.to_str(content)
+
     try:
         rs = json.loads(content)
         ips = rs["ip"]
         g.domain_cache.set_ips(domain, ips)
+        xlog.debug("remote_query_dns %s cost:%f return:%s", domain, t1-t0, ips)
+        if type == 1:
+            ips = [ip for ip in ips if "." in ip ]
         return ips
     except Exception as e:
         xlog.warn("remote_query_dns json:%s parse fail:%s", content, e)
         return []
 
 
-allowed = re.compile("(?!-)[A-Z\d-]{1,63}(?<!-)$")
+allowed = re.compile(br"(?!-)[A-Z\d-]{1,63}(?<!-)$")
 
 
 def is_valid_hostname(hostname):
     hostname = hostname.upper()
     if len(hostname) > 255:
         return False
-    if hostname.endswith("."):
+    if hostname.endswith(b"."):
         hostname = hostname[:-1]
 
-    return all(allowed.match(x) for x in hostname.split("."))
+    return all(allowed.match(x) for x in hostname.split(b"."))
 
 
 class DnsServerList(object):
@@ -75,6 +81,10 @@ class DnsServerList(object):
             self.public_list = ['114.114.114.114', "180.76.76.76", "198.15.67.245", "202.46.32.19", "64.214.116.84"]
         else:
             self.public_list = ['8.8.8.8', "208.67.222.222", "209.244.0.3", "8.26.56.26", "37.235.1.174", "91.239.100.100"]
+
+        self.public_servers = {}
+        for ip in self.public_list:
+            self.public_servers[ip] = {"query_time":0.01, "last_query": time.time()}
 
         self.i = 0
 
@@ -87,14 +97,20 @@ class DnsServerList(object):
             ctypes.windll.dnsapi.DnsQueryConfig(DNS_CONFIG_DNS_SERVER_LIST, 0, None, None, ctypes.byref(buf),
                                                 ctypes.byref(ctypes.wintypes.DWORD(len(buf))))
             ipcount = struct.unpack('I', buf[0:4])[0]
-            iplist = [socket.inet_ntoa(buf[i:i + 4]) for i in xrange(4, ipcount * 4 + 4, 4)]
+
+            # iplist = [socket.inet_ntoa(buf[i:i + 4]) for i in range(4, ipcount * 4 + 4, 4)]
+            iplist = []
+            for i in range(4, ipcount * 4 + 4, 4):
+                ip = socket.inet_ntoa(buf[i:i + 4])
+                iplist.append(ip)
+
         elif os.path.isfile('/etc/resolv.conf'):
             with open('/etc/resolv.conf', 'rb') as fp:
-                iplist = re.findall(r'(?m)^nameserver\s+(\S+)', fp.read())
+                iplist = re.findall(br'(?m)^nameserver\s+(\S+)', fp.read())
 
         out_list = []
         for ip in iplist:
-            if ip == "127.0.0.1":
+            if ip == b"127.0.0.1":
                 continue
             out_list.append(ip)
             xlog.debug("use local DNS server:%s", ip)
@@ -117,6 +133,23 @@ class DnsServerList(object):
     def get_public(self):
         return random.choice(self.public_list)
 
+    def get_fastest_public(self):
+        fastest_ip = ""
+        fastest_time = 10000
+        for ip in self.public_servers:
+            info = self.public_servers[ip]
+            if info["query_time"] < fastest_time:
+                if info["query_time"] > 2 and time.time() - info["last_query"] < 60:
+                    continue
+                fastest_ip = ip
+                fastest_time = info["query_time"]
+
+        return fastest_ip
+
+    def update_public_server(self, ip, cost_time):
+        self.public_servers[ip]["query_time"] = cost_time
+        self.public_servers[ip]["last_query"] = time.time()
+
 
 class DnsClient(object):
     def __init__(self):
@@ -137,7 +170,10 @@ class DnsClient(object):
     def stop(self):
         self.running = False
 
-    def query_over_tcp(self, domain, type=None):
+    def query_over_tcp(self, domain, type=None, loop_count=0):
+        if loop_count > 10:
+            return []
+
         if type is None:
             types = [1, 28]
         else:
@@ -146,32 +182,53 @@ class DnsClient(object):
         ips = []
         for t in types:
             query_time = 0
-            for server_ip in self.dns_server.public_list:
+            for i in range(0, 3):
+                server_ip = self.dns_server.get_fastest_public()
+                if not server_ip:
+                    return []
+
                 query_time += 1
                 if query_time > 3:
                     break
 
+                t0 = time.time()
                 try:
                     d = DNSRecord(DNSHeader())
                     d.add_question(DNSQuestion(domain, t))
-                    a_pkt = d.send(server_ip, 53, tcp=True, timeout=1)
+
+                    a_pkt = d.send(server_ip, 53, tcp=True, timeout=2)
+                    t1 = time.time()
+                    self.dns_server.update_public_server(server_ip, t1-t0)
                     p = DNSRecord.parse(a_pkt)
                     if len(p.rr) == 0:
-                        xlog.warn("query_over_tcp for %s type:%d server:%s return none",
-                                  domain, t, server_ip)
+                        xlog.warn("query_over_tcp for %s type:%d server:%s return none, cost:%f",
+                                  domain, t, server_ip, t1-t0)
                         continue
 
                     for r in p.rr:
-                        ip = str(r.rdata)
+                        ip = bytes(r.rdata)
+                        if utils.check_ip_valid(ip):
+                            if b"." in ip and g.ip_region.check_ip(ip):
+                                cn = g.ip_region.cn
+                            else:
+                                cn = b"XX"
 
-                        if "." in ip and g.ip_region.check_ip(ip):
-                            cn = g.ip_region.cn
+                            if type == 1 and b"." not in ip:
+                                continue
+
+                            ips.append(ip + b"|" + cn)
                         else:
-                            cn = "XX"
-                        ips.append(ip+"|"+cn)
+                            # It is domain, loop search it.
+                            ipss = self.query_over_tcp(ip, type, loop_count+1)
+                            if not ipss:
+                                continue
+                            ips += ipss
 
                     break
                 except Exception as e:
+                    t1 = time.time()
+                    self.dns_server.update_public_server(server_ip, t1 - t0)
+
                     xlog.warn("query_over_tcp %s type:%s server:%s except:%r", domain, type, server_ip,e)
 
         if ips:
@@ -244,11 +301,12 @@ class DnsClient(object):
                         self.sock.sendto(req_pack, (server, 53))
                         continue
 
-                    if "." in ip and g.ip_region.check_ip(ip):
+                    ip = utils.to_bytes(ip)
+                    if b"." in ip and g.ip_region.check_ip(ip):
                         cn = g.ip_region.cn
                     else:
-                        cn = "XX"
-                    ips.append(ip+"|"+cn)
+                        cn = b"XX"
+                    ips.append(ip+b"|"+cn)
 
                 if ips:
                     que.put(ips)
@@ -277,7 +335,8 @@ class DnsClient(object):
             xlog.warn("send_request except:%r", e)
 
     def query(self, domain, timeout=3, use_local=False):
-        end_time = time.time() + timeout
+        t0 = time.time()
+        end_time = t0 + timeout
         while True:
             id = random.randint(0, 65535)
             if id not in self.waiters:
@@ -309,6 +368,9 @@ class DnsClient(object):
 
         if id in self.waiters:
             del self.waiters[id]
+
+        t1 = time.time()
+        xlog.debug("query by udp, %s cost:%f, return:%s", domain, t1-t0, ips)
 
         return ips
 
@@ -402,7 +464,7 @@ class DnsServer(object):
 
             return ips
 
-        if "." not in domain:
+        if b"." not in domain:
             ips = g.dns_client.query(domain, timeout=1, use_local=True)
             if not ips:
                 ips = ["127.0.0.1|XX"]
@@ -430,7 +492,7 @@ class DnsServer(object):
                 return
             except:
                 if time.time() - start_time > 5:
-                    xlog.warn("direct_query %s timeout", request)
+                    xlog.warn("direct_query %s to:%s timeout", server_ip, request)
                     break
 
     def on_udp_query(self, rsock, req_data, addr):
@@ -441,9 +503,9 @@ class DnsServer(object):
                 xlog.warn("query num:%d %s", len(request.questions), request)
                 return
 
-            domain = str(request.questions[0].qname)
+            domain = utils.to_bytes(str(request.questions[0].qname))
 
-            if domain.endswith("."):
+            if domain.endswith(b"."):
                 domain = domain[:-1]
 
             type = request.questions[0].qtype
@@ -459,12 +521,13 @@ class DnsServer(object):
                            (time.time() - start_time) * 1000)
 
             reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1, auth=1), q=request.q)
+            ips = utils.to_bytes(ips)
             for ip_cn in ips:
-                ipcn_p = ip_cn.split("|")
+                ipcn_p = ip_cn.split(b"|")
                 ip = ipcn_p[0]
-                if "." in ip and type == 1:
+                if b"." in ip and type == 1:
                     reply.add_answer(RR(domain, ttl=60, rdata=A(ip)))
-                elif ":" in ip and type == 28:
+                elif b":" in ip and type == 28:
                     reply.add_answer(RR(domain, rtype=type, ttl=60, rdata=AAAA(ip)))
             res_data = reply.pack()
 
